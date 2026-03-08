@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+performance_log_*.json
+mot_eval_*.json
+train_data.json
+*.log
