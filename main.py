@@ -7,7 +7,7 @@
 架构设计：
     视频读取入口 → [Frame Queue / SharedMemory]
                       ↓
-    Tier0 选择器（当前占位实现 + 运动估计）
+    Tier0 时序选择器（结构化特征 + GRU/LSTM checkpoint + guard rails）
                       ↓
     主决策单元
         ├→ CPU预测通道（Kalman）
@@ -19,17 +19,19 @@
             [Result Queue] → 结果汇总与显示
 
 备注：
-    当前代码里为了先把流程跑通，暂时还是用一个占位版 score 再配阈值映射 action。
-    后面这里不强制必须保留 score 这层；可以继续输出 score，也可以直接输出三分类 action。
+    Tier0 现在使用结构化特征时序 selector 输出三分类 action。
 """
 
 
 import cv2
+import os
+import sys
 import time
 import threading
 import queue
 import numpy as np
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 from enum import Enum
 from collections import defaultdict, deque
@@ -38,11 +40,18 @@ from multiprocessing import shared_memory, Queue as MPQueue, Event as MPEvent
 from multiprocessing.resource_tracker import unregister
 import struct
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 from channel_selector_interfaces import (
     ChannelSelectorInput,
     ReaderFeatureExtractor,
     StateSnapshot,
 )
+from channel_selector_runtime import RuntimeChannelSelector
 
 
 try:
@@ -132,10 +141,11 @@ class DetectionResult:
 class Config:
     """系统配置"""
     # ==================== 视频输入 ====================
-    VIDEO_PATH = "MOT17-10-SDP/MOT17-10-SDP.mp4"
+    MEDIA_ROOT = "/home/tan/Desktop/all"
+    VIDEO_PATH = "/home/tan/Desktop/all/organized_dataset/static/MVI_40204/MVI_40204.mp4"
 
     # ==================== MOT评估配置 ====================
-    ENABLE_MOT_EVAL = True  # 启用MOT评估
+    ENABLE_MOT_EVAL = False  # 启用MOT评估
     GT_FILE = "MOT17-10-SDP/gt/gt.txt"  # Ground Truth文件路径
     MOT_IOU_THRESHOLD = 0.5  # IoU匹配阈值
     MOT_TARGET_CLASS = 1  # 目标类别（1=行人），None=全部
@@ -147,14 +157,14 @@ class Config:
     TARGET_EARLY_EXIT_RATIO = 0.8  # 目标早退率 80%（跳过推理的帧占比）
 
     # ==================== 队列大小 ====================
-    FRAME_QUEUE_SIZE = 5       # 减小队列
-    TIER1_QUEUE_SIZE = 5       # 减小队列
-    TIER2_QUEUE_SIZE = 5       # 减小队列
-    RESULT_QUEUE_SIZE = 30     # 结果队列
+    FRAME_QUEUE_SIZE = 30      # 帧队列
+    TIER1_QUEUE_SIZE = 30      # Tier1队列
+    TIER2_QUEUE_SIZE = 30      # Tier2队列
+    RESULT_QUEUE_SIZE = 60     # 结果队列
 
-    # ==================== LSTM 阈值（控制早退率） ====================
-    LSTM_THRESHOLD_LOW = 0.3   # 仅当前占位版 score -> action 映射使用
-    LSTM_THRESHOLD_HIGH = 0.7  # 后面如果改成直接输出 action，可以不依赖这两个阈值
+    # ==================== LSTM 阈值（模型不可用时的规则回退） ====================
+    LSTM_THRESHOLD_LOW = 0.3
+    LSTM_THRESHOLD_HIGH = 0.7
 
     # ==================== YOLO 置信度阈值 ====================
     TIER1_CONF_THRESHOLD = 0.6  # YOLO11n 置信度低于此值 → Tier2
@@ -162,11 +172,11 @@ class Config:
     YOLO_CONF_MIN = 0.25        # 最小置信度阈值
 
     # ==================== 模型路径 ====================
-    MODEL_YOLO11N = "yolo11n_int8.engine"  # Tier1模型
+    MODEL_YOLO11N = "/home/tan/Desktop/all/yolo11n_int8.engine"  # Tier1模型
 
     # Tier2双模型策略（全图用TensorRT，ROI用PyTorch）
-    MODEL_YOLO11M_FULL = "yolo11m_int8.engine"  # Tier2全图
-    MODEL_YOLO11M_ROI = "yolo11m_320_int8.engine"            # Tier2 ROI
+    MODEL_YOLO11M_FULL = "/home/tan/Desktop/all/yolo11m_int8.engine"  # Tier2全图
+    MODEL_YOLO11M_ROI = "/home/tan/Desktop/all/yolo11m_320_int8.engine"            # Tier2 ROI
     ENABLE_DUAL_MODEL = True                     # 启用双模型策略
 
     # 模型输入尺寸
@@ -182,6 +192,9 @@ class Config:
 
     # ==================== 测试模式 ====================
     TEST_MODE_FORCE_TIER1 = False  # 强制所有帧走Tier1（测试用），设为False启用正常调度
+    SIMULATE_YOLO = False           # 跳过YOLO模型加载，使用模拟推理（非Jetson测试用）
+    FORCE_VIS_CHANNEL = "auto"      # auto / kalman / gmc，仅调试可视化用
+    FORCE_VIS_YOLO_INTERVAL = 0     # >0 时距离上次 YOLO 达到 N 帧则强制校正
 
     # ==================== 性能模式 ====================
     PERFORMANCE_MODE = False    # 性能测试模式（静默运行，只输出最终结果）
@@ -204,15 +217,31 @@ class Config:
     ENABLE_STATS = True         # 启用性能统计
     STATS_PRINT_INTERVAL = 30   # 每N帧打印一次统计
     DISPLAY_OUTPUT = False      # 是否显示画面（调试用）
+    SAVE_VIS_VIDEO = False
+    VIS_VIDEO_PATH = "results/pipeline_preview.mp4"
+    TEST_MAX_FRAMES = 0         # 0 表示处理完整视频
     SAVE_LOGS = True           # 保存日志到文件
 
     # ==================== 训练模式配置 ====================
-    TRAIN_MODE = True                           # LSTM训练数据收集模式
+    TRAIN_MODE = False                          # LSTM训练数据收集模式
     TRAIN_DATA_OUTPUT = "train_data.json"       # 训练数据输出文件
     TRAIN_PROGRESS_INTERVAL = 50                # 训练进度打印间隔
 
     # ==================== 策略配置 ====================
     WARMUP_FRAMES = 5           # 启动前N帧强制走推理（等待Tracker稳定）
+    SELECTOR_ENABLED = True
+    SELECTOR_CHECKPOINT = "checkpoints/best.pth"
+    SELECTOR_DEVICE = "cpu"
+    SELECTOR_MAX_SKIP_FRAMES = 10
+    SELECTOR_FORCE_GPU_INTERVAL_FRAMES = 10
+    SELECTOR_HIGH_MOTION_PIXELS = 8.0
+    SELECTOR_HIGH_FLOW_RESIDUAL = 4.0
+    SELECTOR_LOW_FLOW_VALID_RATIO = 0.25
+    SELECTOR_MAX_POSITION_UNCERTAINTY = 2000.0   # mean uncertainty across confirmed tracks
+    SELECTOR_PREDICTION_ERROR_P95 = 0.90         # 1-IoU metric; match calibration interval eval
+    SELECTOR_MIN_TRACKER_CONFIDENCE = 0.20
+    SELECTOR_KALMAN_PREFERENCE_MARGIN = 0.15      # if P(kalman) is close to P(gmc), prefer Kalman
+    SELECTOR_KALMAN_LOW_MOTION_PIXELS = 0.50      # low camera motion: GMC adds little value
 
     # ==================== 运行时视频参数 ====================
     VIDEO_WIDTH = 1920          # 默认 1920 (运行时可能会更新)
@@ -364,12 +393,98 @@ def drain_latest_state_snapshot(
     return snapshot
 
 
+def resolve_existing_runtime_path(path: str) -> str:
+    candidate = Path(path)
+    if candidate.is_absolute() or candidate.exists():
+        return path
+
+    script_dir = Path(__file__).resolve().parent
+    for base in (script_dir, script_dir.parent):
+        resolved = base / candidate
+        if resolved.exists():
+            return str(resolved)
+
+    return path
+
+
+def build_runtime_selector() -> RuntimeChannelSelector:
+    return RuntimeChannelSelector(
+        checkpoint_path=resolve_existing_runtime_path(Config.SELECTOR_CHECKPOINT),
+        device=Config.SELECTOR_DEVICE,
+        fallback_low=Config.LSTM_THRESHOLD_LOW,
+        fallback_high=Config.LSTM_THRESHOLD_HIGH,
+        max_skip_frames=Config.SELECTOR_MAX_SKIP_FRAMES,
+        force_gpu_interval=Config.SELECTOR_FORCE_GPU_INTERVAL_FRAMES,
+        uncertainty_threshold=Config.SELECTOR_MAX_POSITION_UNCERTAINTY,
+        prediction_error_threshold=Config.SELECTOR_PREDICTION_ERROR_P95,
+    )
+
+
+def runtime_selector_ready(selector: RuntimeChannelSelector) -> bool:
+    return bool(getattr(selector, "model_available", False))
+
+
+def runtime_decision_source(decision) -> str:
+    forced_reason = getattr(decision, "forced_reason", "")
+    if forced_reason:
+        return f"forced:{forced_reason}"
+    if getattr(decision, "model_available", False):
+        return "model"
+    return "fallback"
+
+
+def mark_inflight_yolo_for_scheduler(
+    state_snapshot: StateSnapshot,
+    last_scheduled_yolo_frame_id: int,
+) -> StateSnapshot:
+    if last_scheduled_yolo_frame_id < 0:
+        return state_snapshot
+    if state_snapshot.last_gpu_frame_id >= last_scheduled_yolo_frame_id:
+        return state_snapshot
+
+    state_snapshot.last_gpu_frame_id = last_scheduled_yolo_frame_id
+    if not state_snapshot.last_gpu_source:
+        state_snapshot.last_gpu_source = "scheduled_yolo"
+    return state_snapshot
+
+
+def apply_forced_visualization_action(
+    frame_id: int,
+    action_type: int,
+    last_yolo_frame_id: int = -1,
+) -> int:
+    """Optional debug scheduler override for visualization runs."""
+    if Config.FORCE_VIS_YOLO_INTERVAL > 0:
+        if last_yolo_frame_id < 0:
+            return ActionType.INVOKE_TIER1.value
+        if frame_id - last_yolo_frame_id >= Config.FORCE_VIS_YOLO_INTERVAL:
+            return ActionType.INVOKE_TIER1.value
+
+    if Config.FORCE_VIS_CHANNEL == "kalman":
+        return ActionType.SKIP_PREDICT.value
+    if Config.FORCE_VIS_CHANNEL == "gmc":
+        return ActionType.SKIP_GMC.value
+    return action_type
+
+
+def format_selector_probabilities(decision) -> str:
+    probabilities = getattr(decision, "probabilities", None) or {}
+    if not probabilities:
+        return "probs=n/a"
+    return (
+        "probs="
+        f"k:{float(probabilities.get('kalman', 0.0)):.2f},"
+        f"g:{float(probabilities.get('gmc', 0.0)):.2f},"
+        f"y:{float(probabilities.get('inference', 0.0)):.2f}"
+    )
+
+
 class Tier0_LSTM_Thread(threading.Thread):
     """
     Tier 0: LSTM 语义引导 + 运动估计
     职责：
     1. 从 frame_queue 取帧
-    2. LSTM 判断画面变化程度 → lstm_score
+    2. 时序 selector 根据结构化特征输出 action 和 inference score
     3. 光流法计算全局运动向量 → motion_vec
     4. 决策 action 并传递给主决策单元
     """
@@ -391,6 +506,11 @@ class Tier0_LSTM_Thread(threading.Thread):
             blockSize=7
         )
         self.feature_extractor = ReaderFeatureExtractor()
+        self.selector = build_runtime_selector()
+        if runtime_selector_ready(self.selector):
+            print(f"[Tier0-LSTM] ✅ selector checkpoint loaded: {Config.SELECTOR_CHECKPOINT}")
+        elif self.selector.load_error:
+            print(f"[Tier0-LSTM] ⚠️ selector模型不可用，使用规则回退: {self.selector.load_error}")
 
         # 训练模式: GPU 推理状态跟踪 (用于构建真实 StateSnapshot)
         self._train_last_gpu_frame_id = -1
@@ -398,6 +518,7 @@ class Tier0_LSTM_Thread(threading.Thread):
         self._train_last_gpu_max_conf = 0.0
         self._train_recent_gpu_box_counts: deque = deque(maxlen=30)
         self._train_recent_prediction_errors: deque = deque(maxlen=30)
+        self._last_yolo_frame_id = -1
 
     def _build_train_state_snapshot(self, frame_id: int) -> StateSnapshot:
         """训练模式下构建真实的 StateSnapshot (从 tracker + GPU 状态)"""
@@ -465,23 +586,6 @@ class Tier0_LSTM_Thread(threading.Thread):
             prediction_error_p95=prediction_error_p95,
         )
 
-    def _lstm_predict_score(self, frame: np.ndarray) -> float:
-        """
-        【Placeholder】LSTM 预测画面变化程度
-        TODO: 实现轻量级 LSTM 网络
-        """
-
-        if self.prev_frame is None:
-            self.prev_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            return 1.0
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        diff = cv2.absdiff(self.prev_frame, gray)
-        score = np.mean(diff) / 255.0
-
-        self.prev_frame = gray
-        return float(score)
-
     def _estimate_motion_vector(self, frame: np.ndarray) -> Tuple[float, float]:
         """
         估计全局运动向量（使用稀疏光流 Lucas-Kanade）
@@ -539,53 +643,78 @@ class Tier0_LSTM_Thread(threading.Thread):
 
         return (dx, dy)
 
-    def _decide_action(self, lstm_score: float, frame_id: int) -> ActionType:
-        """当前占位版：根据 score 映射动作"""
-
-        if frame_id < Config.WARMUP_FRAMES:
-            return ActionType.INVOKE_TIER1
-
-        if Config.TEST_MODE_FORCE_TIER1:
-            return ActionType.INVOKE_TIER1
-
-        if lstm_score < Config.LSTM_THRESHOLD_LOW:
-            return ActionType.SKIP_PREDICT
-        elif lstm_score < Config.LSTM_THRESHOLD_HIGH:
-            return ActionType.SKIP_GMC
-        else:
-            return ActionType.INVOKE_TIER1
-
     def run(self):
         print("[Tier0-LSTM] 线程启动")
 
         if Config.TRAIN_MODE:
             print("[Tier0-LSTM] ⭐ 训练模式启用：每帧将执行三通道（Kalman/GMC/Inference）")
 
-        while not stop_event.is_set():
+        while not stop_event.is_set() or not frame_queue.empty():
             try:
                 packet: FramePacket = frame_queue.get(timeout=1.0)
 
-                t0 = time.perf_counter()
-                lstm_score = self._lstm_predict_score(packet.image)
-
-                motion_vec = self._estimate_motion_vector(packet.image)
-
-                latency = (time.perf_counter() - t0) * 1000
-
-                packet.lstm_score = lstm_score
-                packet.motion_vec = motion_vec
-
                 if Config.TRAIN_MODE:
+                    t0 = time.perf_counter()
                     frame_features = self.feature_extractor.extract(packet.image, packet.frame_id)
                     state_snapshot = self._build_train_state_snapshot(packet.frame_id)
+                    state_snapshot = mark_inflight_yolo_for_scheduler(
+                        state_snapshot,
+                        self._last_yolo_frame_id,
+                    )
                     selector_input = ChannelSelectorInput(
                         frame_features=frame_features,
                         state_snapshot=state_snapshot,
                     )
-                    self._run_train_mode(packet, lstm_score, motion_vec, selector_input)
+                    decision = self.selector.decide(selector_input)
+                    latency = (time.perf_counter() - t0) * 1000
+                    lstm_score = decision.score
+                    motion_vec = (
+                        frame_features.global_motion_dx,
+                        frame_features.global_motion_dy,
+                    )
+                    packet.lstm_score = lstm_score
+                    packet.motion_vec = motion_vec
+                    self._run_train_mode(
+                        packet,
+                        lstm_score,
+                        motion_vec,
+                        selector_input,
+                        ActionType(decision.action),
+                    )
                 else:
-                    action = self._decide_action(lstm_score, packet.frame_id)
+                    t0 = time.perf_counter()
+                    frame_features = self.feature_extractor.extract(packet.image, packet.frame_id)
+                    state_snapshot = self._build_train_state_snapshot(packet.frame_id)
+                    state_snapshot = mark_inflight_yolo_for_scheduler(
+                        state_snapshot,
+                        self._last_yolo_frame_id,
+                    )
+                    selector_input = ChannelSelectorInput(
+                        frame_features=frame_features,
+                        state_snapshot=state_snapshot,
+                    )
+                    decision = self.selector.decide(selector_input)
+                    latency = (time.perf_counter() - t0) * 1000
+
+                    lstm_score = decision.score
+                    motion_vec = (
+                        frame_features.global_motion_dx,
+                        frame_features.global_motion_dy,
+                    )
+                    packet.lstm_score = lstm_score
+                    packet.motion_vec = motion_vec
+
+                    action = ActionType(decision.action)
+                    action = ActionType(
+                        apply_forced_visualization_action(
+                            packet.frame_id,
+                            action.value,
+                            self._last_yolo_frame_id,
+                        )
+                    )
                     packet.action = action
+                    if action == ActionType.INVOKE_TIER1:
+                        self._last_yolo_frame_id = packet.frame_id
 
                     if action == ActionType.SKIP_PREDICT or action == ActionType.SKIP_GMC:
                         result = self._generate_prediction_result(packet)
@@ -596,7 +725,9 @@ class Tier0_LSTM_Thread(threading.Thread):
 
                     if Config.ENABLE_STATS and packet.frame_id % Config.STATS_PRINT_INTERVAL == 0:
                         print(f"[Tier0] Frame {packet.frame_id}: score={lstm_score:.3f}, "
-                              f"action={action.name_str}, latency={latency:.2f}ms, "
+                              f"action={action.name_str}, selector={runtime_decision_source(decision)}, "
+                              f"{format_selector_probabilities(decision)}, "
+                              f"latency={latency:.2f}ms, "
                               f"queue(t1/t2): {tier1_queue.qsize()}/{tier2_queue.qsize()}")
 
             except queue.Empty:
@@ -609,75 +740,62 @@ class Tier0_LSTM_Thread(threading.Thread):
         print("[Tier0-LSTM] 线程结束")
 
     def _run_train_mode(self, packet: FramePacket, lstm_score: float, motion_vec: Tuple[float, float],
-                        selector_input: Optional[ChannelSelectorInput] = None):
+                        selector_input: Optional[ChannelSelectorInput] = None,
+                        selected_action: Optional[ActionType] = None):
         """
-        训练模式：同时执行三个通道并收集数据
+        训练模式：三通道 oracle 标注 + selector 真实决策驱动 pipeline 状态
 
-        1. Kalman 预测
-        2. GMC 预测
-        3. Tier1/Tier2 推理（阻塞等待结果）
+        - Kalman 和 GMC 每帧都跑（oracle 比较用）
+        - YOLO 每帧都跑（oracle 标注用），结果只进 train_result_queue
+        - selector 做真实决策：决定哪个通道的结果进 result_queue（驱动 StateSnapshot 演变）
+        - GPU 状态跟踪（frames_since_last_gpu 等）只在 selector 真正选 INVOKE_TIER1 时更新
         """
         global global_train_collector, train_collector_lock
 
         frame_id = packet.frame_id
-
         selector_features = selector_input.to_feature_dict() if selector_input is not None else None
 
         if global_train_collector is not None:
             with train_collector_lock:
                 global_train_collector.init_frame(frame_id, lstm_score, motion_vec, selector_features)
 
-        t_kalman_start = time.perf_counter()
+        # Selector 做真实决策（不再强制 INVOKE_TIER1）
+        if selected_action is None:
+            selected_action = ActionType.INVOKE_TIER1
 
+        # --- Kalman（每帧，oracle 比较用）---
+        t_kalman_start = time.perf_counter()
         packet.action = ActionType.SKIP_PREDICT
         kalman_result = self._generate_kalman_prediction(packet)
-
         kalman_latency = (time.perf_counter() - t_kalman_start) * 1000
 
         if global_train_collector is not None:
             with train_collector_lock:
-                global_train_collector.add_kalman_result(
-                    frame_id,
-                    kalman_result.boxes,
-                    kalman_latency
-                )
+                global_train_collector.add_kalman_result(frame_id, kalman_result.boxes, kalman_latency)
 
+        # --- GMC（每帧，oracle 比较用）---
         t_gmc_start = time.perf_counter()
-
         packet.action = ActionType.SKIP_GMC
         gmc_result = self._generate_gmc_prediction(packet)
-
         gmc_latency = (time.perf_counter() - t_gmc_start) * 1000
 
         if global_train_collector is not None:
             with train_collector_lock:
-                global_train_collector.add_gmc_result(
-                    frame_id,
-                    gmc_result.boxes,
-                    gmc_latency
-                )
+                global_train_collector.add_gmc_result(frame_id, gmc_result.boxes, gmc_latency)
 
+        # --- YOLO（每帧，oracle 标注用；结果只进 train_result_queue，不进 result_queue）---
         packet.action = ActionType.INVOKE_TIER1
-
-        if not hasattr(packet, 'train_mode_flag'):
-            pass
-
         tier1_queue.put(packet)
 
+        inference_result = None
         try:
             inference_result = train_result_queue.get(timeout=10.0)
-
             while inference_result.frame_id != frame_id:
                 inference_result = train_result_queue.get(timeout=5.0)
 
-            # 更新 GPU 推理状态跟踪 (供下一帧的 StateSnapshot 使用)
             num_boxes = len(inference_result.boxes)
-            self._train_last_gpu_frame_id = inference_result.frame_id
-            self._train_last_gpu_source = inference_result.source
-            self._train_last_gpu_max_conf = inference_result.max_conf
-            self._train_recent_gpu_box_counts.append(num_boxes)
 
-            # 计算预测误差 (kalman vs inference)
+            # 计算 Kalman 预测误差（每帧都算，供 StateSnapshot 使用）
             if kalman_result.boxes and inference_result.boxes:
                 ious = []
                 used = set()
@@ -697,6 +815,14 @@ class Tier0_LSTM_Thread(threading.Thread):
                 if ious:
                     self._train_recent_prediction_errors.append(float(1.0 - np.mean(ious)))
 
+            # GPU 状态跟踪：只有 selector 真正选了 INVOKE_TIER1 才更新
+            # 这样 frames_since_last_gpu 才能像部署时一样真实增长
+            if selected_action == ActionType.INVOKE_TIER1:
+                self._train_last_gpu_frame_id = inference_result.frame_id
+                self._train_last_gpu_source = inference_result.source
+                self._train_last_gpu_max_conf = inference_result.max_conf
+                self._train_recent_gpu_box_counts.append(num_boxes)
+
             if global_train_collector is not None:
                 with train_collector_lock:
                     global_train_collector.add_inference_result(
@@ -705,14 +831,18 @@ class Tier0_LSTM_Thread(threading.Thread):
                         inference_result.latency_ms,
                         inference_result.source
                     )
-
-                    global_train_collector.print_progress(
-                        frame_id,
-                        Config.TRAIN_PROGRESS_INTERVAL
-                    )
+                    global_train_collector.print_progress(frame_id, Config.TRAIN_PROGRESS_INTERVAL)
 
         except queue.Empty:
             print(f"[Tier0-Train] ⚠️ Frame {frame_id}: 等待推理结果超时")
+
+        # --- 驱动 pipeline 状态：selector 决策的通道结果进 result_queue ---
+        if selected_action == ActionType.SKIP_PREDICT:
+            result_queue.put(kalman_result)
+        elif selected_action == ActionType.SKIP_GMC:
+            result_queue.put(gmc_result)
+        elif inference_result is not None:
+            result_queue.put(inference_result)
 
     def _generate_prediction_result(self, packet: FramePacket) -> DetectionResult:
         """
@@ -769,6 +899,7 @@ class Tier0_LSTM_Thread(threading.Thread):
             source="tier0_predict",
             latency_ms=0.5,
             timestamp=packet.timestamp,
+            image=packet.image,
             max_conf=max([b['conf'] for b in clipped_boxes]) if clipped_boxes else 0.0,
             num_boxes=len(clipped_boxes)
         )
@@ -791,7 +922,8 @@ class Tier0_LSTM_Thread(threading.Thread):
                 boxes=[],
                 source="tier0_gmc",
                 latency_ms=0.5,
-                timestamp=packet.timestamp
+                timestamp=packet.timestamp,
+                image=packet.image,
             )
 
         motion_vec = packet.motion_vec if packet.motion_vec else (0.0, 0.0)
@@ -826,12 +958,19 @@ class Tier0_LSTM_Thread(threading.Thread):
             print(f"[Tier0-GMC] Frame {packet.frame_id}: motion=({dx:.1f}, {dy:.1f}), "
                   f"predicted {len(predicted_boxes)} boxes from frame {prev_frame_id}")
 
+        if predicted_boxes:
+            with latest_detection_lock:
+                if packet.frame_id >= latest_detection_frame_id:
+                    latest_detection_boxes = [box.copy() for box in predicted_boxes]
+                    latest_detection_frame_id = packet.frame_id
+
         return DetectionResult(
             frame_id=packet.frame_id,
             boxes=predicted_boxes,
             source="tier0_gmc",
             latency_ms=0.5,
             timestamp=packet.timestamp,
+            image=packet.image,
             max_conf=max([b['conf'] for b in predicted_boxes]) if predicted_boxes else 0.0,
             num_boxes=len(predicted_boxes)
         )
@@ -849,9 +988,16 @@ class Tier1_YOLO_Thread(threading.Thread):
         super().__init__(daemon=True, name="Tier1-YOLO11n")
         self.model = None
         self.ready_event = threading.Event()
+        self.sim_frame_counter = 0
 
     def _load_model(self):
         """加载 YOLO11n 模型（支持TensorRT/PyTorch）"""
+        if Config.SIMULATE_YOLO:
+            print("[Tier1] SIMULATE_YOLO=True，跳过 YOLO11n 模型加载")
+            self.model = None
+            self.ready_event.set()
+            return
+
         print(f"[Tier1] 加载 YOLO11n 模型: {Config.MODEL_YOLO11N}")
         try:
             from ultralytics import YOLO
@@ -881,8 +1027,8 @@ class Tier1_YOLO_Thread(threading.Thread):
 
         if self.model is None:
             time.sleep(0.010)
-            boxes = []
-            max_conf = np.random.uniform(0.3, 0.9)
+            boxes = self._simulated_boxes(image, base_conf=0.72)
+            max_conf = max([b['conf'] for b in boxes]) if boxes else np.random.uniform(0.3, 0.9)
             timing.total_ms = 10.0
             timing.inference_ms = 8.0
             timing.preprocess_ms = 1.0
@@ -933,12 +1079,41 @@ class Tier1_YOLO_Thread(threading.Thread):
 
         return boxes
 
+    def _simulated_boxes(self, image: np.ndarray, base_conf: float) -> List[Dict]:
+        h, w = image.shape[:2]
+        self.sim_frame_counter += 1
+        phase = self.sim_frame_counter
+        x1 = int((w * 0.18 + phase * 3) % max(1, w - 180))
+        y1 = int(h * 0.28)
+        x2 = min(w - 1, x1 + int(w * 0.16))
+        y2 = min(h - 1, y1 + int(h * 0.24))
+        boxes = [{
+            'x1': float(x1),
+            'y1': float(y1),
+            'x2': float(x2),
+            'y2': float(y2),
+            'conf': float(base_conf),
+            'class': 0,
+        }]
+        if phase % 3 == 0:
+            x1b = int(w * 0.58)
+            y1b = int((h * 0.18 + phase * 2) % max(1, h - 160))
+            boxes.append({
+                'x1': float(x1b),
+                'y1': float(y1b),
+                'x2': float(min(w - 1, x1b + int(w * 0.13))),
+                'y2': float(min(h - 1, y1b + int(h * 0.20))),
+                'conf': float(base_conf - 0.08),
+                'class': 0,
+            })
+        return boxes
+
     def run(self):
         self._load_model()
         if not Config.PERFORMANCE_MODE:
             print("[Tier1-YOLO11n] 线程启动")
 
-        while not stop_event.is_set():
+        while not stop_event.is_set() or not tier1_queue.empty():
             try:
                 packet: FramePacket = tier1_queue.get(timeout=1.0)
 
@@ -964,14 +1139,15 @@ class Tier1_YOLO_Thread(threading.Thread):
                         source="tier1",
                         latency_ms=timing.total_ms,
                         timestamp=packet.timestamp,
+                        image=packet.image,
                         timing=timing,
                         max_conf=max_conf,
                         num_boxes=len(boxes)
                     )
-                    result_queue.put(result)
-
                     if Config.TRAIN_MODE:
                         train_result_queue.put(result)
+                    else:
+                        result_queue.put(result)
 
                     if Config.ENABLE_STATS and not Config.PERFORMANCE_MODE:
                         print(f"[Tier1] Frame {packet.frame_id}: max_conf={max_conf:.2f}, "
@@ -1000,12 +1176,21 @@ class Tier2_YOLO_Thread(threading.Thread):
         self.model_full = None
         self.model_roi = None
         self.ready_event = threading.Event()
+        self.sim_frame_counter = 0
 
         self.stats_full = []
         self.stats_roi = []
 
     def _load_model(self):
         """加载 YOLO11m 双模型（全图TensorRT + ROI）"""
+        if Config.SIMULATE_YOLO:
+            if not Config.PERFORMANCE_MODE:
+                print("[Tier2] SIMULATE_YOLO=True，跳过 YOLO11m 模型加载")
+            self.model_full = None
+            self.model_roi = None
+            self.ready_event.set()
+            return
+
         from ultralytics import YOLO
 
         if not Config.PERFORMANCE_MODE:
@@ -1071,7 +1256,7 @@ class Tier2_YOLO_Thread(threading.Thread):
             timing.inference_ms = 16.0
             timing.preprocess_ms = 2.0
             timing.postprocess_ms = 2.0
-            return [], "sim", timing
+            return self._simulated_boxes(image, base_conf=0.82), "sim", timing
 
         if Config.ENABLE_DUAL_MODEL and Config.ENABLE_ROI_CROP and roi_boxes and len(roi_boxes) > 0 and self.model_roi is not None:
             boxes, timing = self._inference_with_roi(image, roi_boxes)
@@ -1187,6 +1372,21 @@ class Tier2_YOLO_Thread(threading.Thread):
                 })
         return boxes
 
+    def _simulated_boxes(self, image: np.ndarray, base_conf: float) -> List[Dict]:
+        h, w = image.shape[:2]
+        self.sim_frame_counter += 1
+        phase = self.sim_frame_counter
+        x1 = int((w * 0.20 + phase * 3) % max(1, w - 180))
+        y1 = int(h * 0.30)
+        return [{
+            'x1': float(x1),
+            'y1': float(y1),
+            'x2': float(min(w - 1, x1 + int(w * 0.15))),
+            'y2': float(min(h - 1, y1 + int(h * 0.23))),
+            'conf': float(base_conf),
+            'class': 0,
+        }]
+
     def _nms_boxes(self, boxes: List[Dict]) -> List[Dict]:
         """全局NMS去重"""
         if len(boxes) == 0:
@@ -1226,7 +1426,7 @@ class Tier2_YOLO_Thread(threading.Thread):
         if not Config.PERFORMANCE_MODE:
             print("[Tier2-YOLO11m] 线程启动")
 
-        while not stop_event.is_set():
+        while not stop_event.is_set() or not tier2_queue.empty():
             try:
                 packet: FramePacket = tier2_queue.get(timeout=1.0)
 
@@ -1246,14 +1446,15 @@ class Tier2_YOLO_Thread(threading.Thread):
                     source=source,
                     latency_ms=timing.total_ms,
                     timestamp=packet.timestamp,
+                    image=packet.image,
                     timing=timing,
                     max_conf=max_conf,
                     num_boxes=len(boxes)
                 )
-                result_queue.put(result)
-
                 if Config.TRAIN_MODE:
                     train_result_queue.put(result)
+                else:
+                    result_queue.put(result)
 
                 if Config.ENABLE_STATS and not Config.PERFORMANCE_MODE:
                     model_info = "ROI(320)" if model_type == "roi" else "Full(640)"
@@ -1320,6 +1521,7 @@ class ResultProcessor(threading.Thread):
             print(f"[ResultProcessor] ⚠️ MOT评估已启用但模块不可用")
 
         self.gmc_evaluations = []
+        self.tier0_predict_evaluations = []
         self.motion_vectors = []
         self.source_transitions = defaultdict(lambda: defaultdict(int))
         self.last_source = None
@@ -1335,13 +1537,14 @@ class ResultProcessor(threading.Thread):
         self.last_gpu_frame_id = -1
         self.last_gpu_source = ""
         self.last_gpu_max_conf = 0.0
+        self.video_writer = None
 
     def run(self):
         if not Config.PERFORMANCE_MODE:
             print("[ResultProcessor] 线程启动")
         self.start_time = time.time()
 
-        while not stop_event.is_set():
+        while not stop_event.is_set() or not result_queue.empty():
             try:
                 result: DetectionResult = result_queue.get(timeout=1.0)
 
@@ -1363,8 +1566,9 @@ class ResultProcessor(threading.Thread):
                 if result.source in gpu_sources and num_boxes > 0:
                     global latest_detection_boxes, latest_detection_frame_id, latest_detection_lock
                     with latest_detection_lock:
-                        latest_detection_boxes = [box.copy() for box in result.boxes]
-                        latest_detection_frame_id = result.frame_id
+                        if result.frame_id >= latest_detection_frame_id:
+                            latest_detection_boxes = [box.copy() for box in result.boxes]
+                            latest_detection_frame_id = result.frame_id
 
                     global global_kalman_tracker, kalman_tracker_lock
                     if global_kalman_tracker is not None:
@@ -1381,21 +1585,26 @@ class ResultProcessor(threading.Thread):
                     self.tier0_predict_frame_count += 1
 
                 if result.source in gpu_sources:
-                    gmc_source = "tier0_gmc"
-                    if gmc_source in self.last_boxes_by_source:
-                        predicted_boxes = self.last_boxes_by_source[gmc_source]
+                    for predicted_source, evaluations in (
+                        ("tier0_gmc", self.gmc_evaluations),
+                        ("tier0_predict", self.tier0_predict_evaluations),
+                    ):
+                        if predicted_source not in self.last_boxes_by_source:
+                            continue
+                        predicted_boxes = self.last_boxes_by_source[predicted_source]
                         actual_boxes = result.boxes
                         if predicted_boxes and actual_boxes:
                             ious = self._calculate_box_ious(predicted_boxes, actual_boxes)
                             mean_iou = np.mean(ious) if ious else 0.0
-                            self.gmc_evaluations.append({
+                            evaluations.append({
                                 'frame_id': result.frame_id,
                                 'predicted_count': len(predicted_boxes),
                                 'actual_count': len(actual_boxes),
                                 'ious': ious,
                                 'mean_iou': mean_iou
                             })
-                            self.recent_prediction_errors.append(float(1.0 - mean_iou))
+                            if predicted_source == "tier0_gmc":
+                                self.recent_prediction_errors.append(float(1.0 - mean_iou))
 
                 if result.source == "tier0_gmc" and self.mot_evaluator is not None:
                     mot_frame_id = result.frame_id + 1
@@ -1458,6 +1667,8 @@ class ResultProcessor(threading.Thread):
 
                 if Config.DISPLAY_OUTPUT:
                     self._display_result(result)
+                if Config.SAVE_VIS_VIDEO:
+                    self._write_visualized_frame(result)
 
             except queue.Empty:
                 continue
@@ -1471,6 +1682,11 @@ class ResultProcessor(threading.Thread):
 
         if Config.TRAIN_MODE and global_train_collector is not None:
             global_train_collector.save_to_file(Config.TRAIN_DATA_OUTPUT)
+
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
+            print(f"[ResultProcessor] 可视化视频已保存: {Config.VIS_VIDEO_PATH}")
 
         if not Config.PERFORMANCE_MODE:
             print("[ResultProcessor] 线程结束")
@@ -1490,16 +1706,55 @@ class ResultProcessor(threading.Thread):
         if result.image is None:
             return
 
+        display_img = self._render_result_frame(result)
+        cv2.imshow("Detection Results", display_img)
+        cv2.waitKey(1)
+
+    def _write_visualized_frame(self, result: DetectionResult):
+        if result.image is None:
+            return
+
+        frame = self._render_result_frame(result)
+        if self.video_writer is None:
+            output_dir = os.path.dirname(Config.VIS_VIDEO_PATH)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            h, w = frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self.video_writer = cv2.VideoWriter(
+                Config.VIS_VIDEO_PATH,
+                fourcc,
+                float(Config.TARGET_FPS),
+                (w, h),
+            )
+            if not self.video_writer.isOpened():
+                print(f"[ResultProcessor] ⚠️ 无法创建可视化视频: {Config.VIS_VIDEO_PATH}")
+                self.video_writer = None
+                return
+
+        self.video_writer.write(frame)
+
+    def _render_result_frame(self, result: DetectionResult) -> np.ndarray:
         display_img = result.image.copy()
 
         color_map = {
-            "tier0_predict": (128, 128, 128),
-            "tier0_gmc": (255, 165, 0),
+            "tier0_predict": (255, 0, 0),
+            "tier0_gmc": (0, 165, 255),
             "tier1": (0, 255, 0),
-            "tier2": (0, 0, 255),
-            "tier2_roi": (255, 0, 255),
+            "tier2": (0, 255, 0),
+            "tier2_roi": (0, 255, 0),
+            "tier2_sim": (0, 255, 0),
+        }
+        label_map = {
+            "tier0_predict": "KALMAN",
+            "tier0_gmc": "GMC",
+            "tier1": "YOLO-T1",
+            "tier2": "YOLO-T2",
+            "tier2_roi": "YOLO-ROI",
+            "tier2_sim": "YOLO-SIM",
         }
         color = color_map.get(result.source, (255, 255, 255))
+        source_label = label_map.get(result.source, result.source)
 
         for box in result.boxes:
             x1, y1, x2, y2 = int(box['x1']), int(box['y1']), int(box['x2']), int(box['y2'])
@@ -1508,16 +1763,17 @@ class ResultProcessor(threading.Thread):
 
             cv2.rectangle(display_img, (x1, y1), (x2, y2), color, 2)
 
-            label = f"cls:{cls} {conf:.2f}"
+            label = f"{source_label} cls:{cls} {conf:.2f}"
             (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(display_img, (x1, y1 - label_h - 5), (x1 + label_w, y1), color, -1)
             cv2.putText(display_img, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        info_text = f"Frame:{result.frame_id} Source:{result.source} Latency:{result.latency_ms:.1f}ms"
+        info_text = f"Frame:{result.frame_id} Source:{source_label} Latency:{result.latency_ms:.1f}ms"
         cv2.putText(display_img, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        cv2.imshow("Detection Results", display_img)
-        cv2.waitKey(1)
+        legend = "Kalman=blue  GMC=orange  YOLO=green"
+        cv2.putText(display_img, legend, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+        return display_img
 
     def _calculate_single_iou(self, box1: Dict, box2: Dict) -> float:
         """计算两个框的IoU"""
@@ -1936,6 +2192,63 @@ class ResultProcessor(threading.Thread):
         else:
             print(f"  ❌ GMC预测质量较差（平均IoU < 0.3），建议调整运动估计参数")
 
+        self._print_tier0_predict_evaluation()
+
+    def _summarize_prediction_evaluations(self, evaluations: List[Dict]) -> Dict:
+        all_ious = []
+        total_predicted = 0
+        total_actual = 0
+        for eval_data in evaluations:
+            all_ious.extend(eval_data.get('ious', []))
+            total_predicted += int(eval_data.get('predicted_count', 0))
+            total_actual += int(eval_data.get('actual_count', 0))
+
+        if not all_ious:
+            return {
+                'evaluation_count': len(evaluations),
+                'predicted_count': total_predicted,
+                'actual_count': total_actual,
+                'matched_count': 0,
+                'mean_iou': 0.0,
+                'median_iou': 0.0,
+                'zero_iou_count': 0,
+                'success_rate_by_threshold': {
+                    '0.3': 0.0,
+                    '0.5': 0.0,
+                    '0.7': 0.0,
+                },
+            }
+
+        return {
+            'evaluation_count': len(evaluations),
+            'predicted_count': total_predicted,
+            'actual_count': total_actual,
+            'matched_count': len(all_ious),
+            'mean_iou': float(np.mean(all_ious)),
+            'median_iou': float(np.median(all_ious)),
+            'zero_iou_count': int(sum(1 for iou in all_ious if iou == 0)),
+            'success_rate_by_threshold': {
+                str(thresh): float(sum(1 for iou in all_ious if iou >= thresh) / len(all_ious))
+                for thresh in (0.3, 0.5, 0.7)
+            },
+        }
+
+    def _print_tier0_predict_evaluation(self):
+        if not self.tier0_predict_evaluations:
+            print(f"\n【Kalman预测评估】")
+            print("  ⚠️  没有Kalman与下一帧推理的对比数据（可能当前调度未使用Kalman）")
+            return
+
+        summary = self._summarize_prediction_evaluations(self.tier0_predict_evaluations)
+        print(f"\n【Kalman预测评估】")
+        print(f"  评估帧数:    {summary['evaluation_count']}")
+        print(f"  预测框总数:  {summary['predicted_count']}")
+        print(f"  实际框总数:  {summary['actual_count']}")
+        print(f"  平均IoU:     {summary['mean_iou']:.4f}")
+        print(f"  中位数IoU:   {summary['median_iou']:.4f}")
+        for thresh, rate in summary['success_rate_by_threshold'].items():
+            print(f"  IoU >= {thresh}: {rate * 100:.1f}%")
+
     def _print_source_transitions(self):
         """打印层级转换分析"""
         print(f"\n【层级转换分析】（调度策略效果）")
@@ -2117,6 +2430,12 @@ class ResultProcessor(threading.Thread):
                 "tier0_predict_frame_count": self.tier0_predict_frame_count,
                 "gmc_vs_inference_count": len(self.gmc_evaluations),
                 "gmc_vs_gt_count": len(self.gmc_gt_evaluations),
+                "gmc_vs_inference_summary": self._summarize_prediction_evaluations(
+                    self.gmc_evaluations
+                ),
+                "kalman_vs_inference_summary": self._summarize_prediction_evaluations(
+                    self.tier0_predict_evaluations
+                ),
                 "accuracy_by_threshold": {
                     str(thresh): {
                         "correct": self.gmc_accuracy_by_threshold[thresh]['correct'],
@@ -2213,6 +2532,9 @@ class VideoReader:
         start_time = time.time()
 
         while not stop_event.is_set():
+            if Config.TEST_MAX_FRAMES > 0 and frame_id >= Config.TEST_MAX_FRAMES:
+                print(f"📹 达到测试帧数上限: {Config.TEST_MAX_FRAMES}")
+                break
             ret, frame = self.cap.read()
             if not ret:
                 print("📹 视频读取完成")
@@ -2242,6 +2564,7 @@ def video_reader_process(
     stop_event: MPEvent,
     ready_event: MPEvent,
     state_snapshot_queue: Optional[MPQueue] = None,
+    max_frames: int = 0,
 ):
     """
     视频读取进程（包含Tier0 LSTM预测）
@@ -2270,6 +2593,11 @@ def video_reader_process(
 
     feature_extractor = ReaderFeatureExtractor()
     latest_state_snapshot = StateSnapshot()
+    selector = build_runtime_selector()
+    if runtime_selector_ready(selector):
+        print(f"[VideoReaderProcess] ✅ selector checkpoint loaded: {Config.SELECTOR_CHECKPOINT}")
+    elif selector.load_error:
+        print(f"[VideoReaderProcess] ⚠️ selector模型不可用，使用规则回退: {selector.load_error}")
 
     ready_event.set()
     print("[VideoReaderProcess] ✅ 就绪")
@@ -2277,9 +2605,13 @@ def video_reader_process(
     frame_id = 0
     start_time = time.time()
     slot_idx = 0
+    last_yolo_frame_id = -1
 
     try:
         while not stop_event.is_set():
+            if max_frames > 0 and frame_id >= max_frames:
+                print(f"[VideoReaderProcess] 达到测试帧数上限: {max_frames}")
+                break
             ret, frame = cap.read()
             if not ret:
                 print("[VideoReaderProcess] 📹 视频读取完成")
@@ -2290,25 +2622,38 @@ def video_reader_process(
             latest_state_snapshot = drain_latest_state_snapshot(
                 state_snapshot_queue, latest_state_snapshot
             )
+            latest_state_snapshot = mark_inflight_yolo_for_scheduler(
+                latest_state_snapshot,
+                last_yolo_frame_id,
+            )
             selector_input = ChannelSelectorInput(
                 frame_features=frame_features,
                 state_snapshot=latest_state_snapshot,
             )
-
-            if frame_features.is_bootstrap_frame:
+            if Config.TEST_MODE_FORCE_TIER1:
+                decision_source = "force_tier1"
                 lstm_score = 1.0
                 action_type = ActionType.INVOKE_TIER1.value
             else:
-                lstm_score = selector_input.frame_features.frame_diff_mean
-
-                if Config.TEST_MODE_FORCE_TIER1:
-                    action_type = ActionType.INVOKE_TIER1.value
-                elif lstm_score < Config.LSTM_THRESHOLD_LOW:
-                    action_type = ActionType.SKIP_PREDICT.value
-                elif lstm_score < Config.LSTM_THRESHOLD_HIGH:
-                    action_type = ActionType.SKIP_GMC.value
-                else:
-                    action_type = ActionType.INVOKE_TIER1.value
+                decision = selector.decide(selector_input)
+                decision_source = runtime_decision_source(decision)
+                lstm_score = decision.score
+                action_type = decision.action
+                if frame_id < 30:
+                    print(
+                        f"[DBG] frame={frame_id} action={action_type} source={decision_source} "
+                        f"last_gpu_frame_id={latest_state_snapshot.last_gpu_frame_id} "
+                        f"frames_since_gpu={latest_state_snapshot.frames_since_last_gpu(frame_id)} "
+                        f"last_yolo={last_yolo_frame_id} "
+                        f"forced={getattr(decision, 'forced_reason', '')}"
+                    )
+            action_type = apply_forced_visualization_action(
+                frame_id,
+                action_type,
+                last_yolo_frame_id,
+            )
+            if action_type == ActionType.INVOKE_TIER1.value:
+                last_yolo_frame_id = frame_id
 
             shm_buffer.write_frame(
                 slot_idx=slot_idx,
@@ -2335,6 +2680,8 @@ def video_reader_process(
                 elapsed = time.time() - start_time
                 fps = frame_id / elapsed if elapsed > 0 else 0
                 print(f"[VideoReaderProcess] Frame {frame_id}: lstm_score={lstm_score:.3f}, "
+                      f"selector={decision_source}, "
+                      f"{format_selector_probabilities(decision) if not Config.TEST_MODE_FORCE_TIER1 else 'probs=n/a'}, "
                       f"motion=({frame_features.global_motion_dx:.2f}, {frame_features.global_motion_dy:.2f}), "
                       f"tracks={latest_state_snapshot.tracker_count}, "
                       f"frames_since_gpu={latest_state_snapshot.frames_since_last_gpu(frame_id)}, "
@@ -2369,7 +2716,10 @@ class FrameDispatcher(threading.Thread):
         if not Config.PERFORMANCE_MODE:
             print("[FrameDispatcher] 线程启动")
 
-        while not stop_event.is_set() and not self.stop_event_mp.is_set():
+        while (
+            (not stop_event.is_set() and not self.stop_event_mp.is_set())
+            or not self.frame_index_queue.empty()
+        ):
             try:
                 slot_idx = self.frame_index_queue.get(timeout=1.0)
 
@@ -2444,6 +2794,7 @@ class FrameDispatcher(threading.Thread):
             source="tier0_predict",
             latency_ms=0.5,
             timestamp=packet.timestamp,
+            image=packet.image,
             max_conf=max([b['conf'] for b in clipped_boxes]) if clipped_boxes else 0.0,
             num_boxes=len(clipped_boxes)
         )
@@ -2462,7 +2813,8 @@ class FrameDispatcher(threading.Thread):
                 boxes=[],
                 source="tier0_gmc",
                 latency_ms=0.5,
-                timestamp=packet.timestamp
+                timestamp=packet.timestamp,
+                image=packet.image,
             )
 
         dx, dy = packet.motion_vec if packet.motion_vec else (0.0, 0.0)
@@ -2488,12 +2840,19 @@ class FrameDispatcher(threading.Thread):
                         'class': box['class']
                     })
 
+        if predicted_boxes:
+            with latest_detection_lock:
+                if packet.frame_id >= latest_detection_frame_id:
+                    latest_detection_boxes = [box.copy() for box in predicted_boxes]
+                    latest_detection_frame_id = packet.frame_id
+
         return DetectionResult(
             frame_id=packet.frame_id,
             boxes=predicted_boxes,
             source="tier0_gmc",
             latency_ms=0.5,
             timestamp=packet.timestamp,
+            image=packet.image,
             max_conf=max([b['conf'] for b in predicted_boxes]) if predicted_boxes else 0.0,
             num_boxes=len(predicted_boxes)
         )
@@ -2598,6 +2957,7 @@ def main_multiprocess():
             stop_event_mp,
             reader_ready_event,
             state_snapshot_queue,
+            Config.TEST_MAX_FRAMES,
         ),
         name="VideoReaderProcess"
     )
@@ -2749,7 +3109,66 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='LSTM Train Mode / Inference System')
     parser.add_argument('dataset_root', nargs='?', help='Path to the MOT dataset root directory (e.g., .../MOT17-10-SDP)')
+    parser.add_argument('--video', help='Direct video path. Overrides dataset_root video discovery.')
+    parser.add_argument('--media-root', default=None, help='Directory containing TensorRT engines and videos.')
+    parser.add_argument('--selector-checkpoint', default=None, help='Runtime selector checkpoint path.')
+    parser.add_argument('--train-mode', action='store_true', help='Enable training data collection mode.')
+    parser.add_argument('--save-video', action='store_true', help='Save color-coded visualization video.')
+    parser.add_argument('--output-video', default=None, help='Visualization MP4 output path.')
+    parser.add_argument('--max-frames', type=int, default=None, help='Stop after N frames for quick tests.')
+    parser.add_argument('--simulate-yolo', action='store_true', help='Skip TensorRT/YOLO loading and use simulated detections.')
+    parser.add_argument('--enable-mot-eval', action='store_true', help='Enable MOT evaluation if GT is available.')
+    parser.add_argument('--channel', choices=('auto', 'kalman', 'gmc'), default=None, help='Debug scheduler override for visualization.')
+    parser.add_argument('--yolo-interval', type=int, default=None, help='Force YOLO when N frames have elapsed since the last YOLO call; otherwise use the GRU selector output.')
     args = parser.parse_args()
+
+    if args.media_root:
+        Config.MEDIA_ROOT = args.media_root.rstrip(os.sep)
+        Config.MODEL_YOLO11N = os.path.join(Config.MEDIA_ROOT, "yolo11n_int8.engine")
+        Config.MODEL_YOLO11M_FULL = os.path.join(Config.MEDIA_ROOT, "yolo11m_int8.engine")
+        Config.MODEL_YOLO11M_ROI = os.path.join(Config.MEDIA_ROOT, "yolo11m_320_int8.engine")
+        print(f"[CLI] ✅ media root已设置: {Config.MEDIA_ROOT}")
+
+    if args.selector_checkpoint:
+        Config.SELECTOR_CHECKPOINT = args.selector_checkpoint
+        print(f"[CLI] ✅ selector checkpoint已设置: {Config.SELECTOR_CHECKPOINT}")
+
+    if args.train_mode:
+        Config.TRAIN_MODE = True
+        print("[CLI] ✅ 训练数据收集模式已启用")
+
+    if args.simulate_yolo:
+        Config.SIMULATE_YOLO = True
+        print("[CLI] ✅ YOLO模拟模式已启用")
+
+    if args.enable_mot_eval:
+        Config.ENABLE_MOT_EVAL = True
+        print("[CLI] ✅ MOT评估已启用")
+
+    if args.channel is not None:
+        Config.FORCE_VIS_CHANNEL = args.channel
+        print(f"[CLI] ✅ 可视化调度通道: {Config.FORCE_VIS_CHANNEL}")
+
+    if args.yolo_interval is not None:
+        Config.FORCE_VIS_YOLO_INTERVAL = max(0, int(args.yolo_interval))
+        print(f"[CLI] ✅ YOLO校正间隔: {Config.FORCE_VIS_YOLO_INTERVAL}")
+
+    if args.save_video:
+        Config.SAVE_VIS_VIDEO = True
+        print("[CLI] ✅ 可视化视频保存已启用")
+
+    if args.output_video:
+        Config.VIS_VIDEO_PATH = args.output_video
+        Config.SAVE_VIS_VIDEO = True
+        print(f"[CLI] ✅ 可视化视频输出: {Config.VIS_VIDEO_PATH}")
+
+    if args.max_frames is not None:
+        Config.TEST_MAX_FRAMES = max(0, int(args.max_frames))
+        print(f"[CLI] ✅ 最大测试帧数: {Config.TEST_MAX_FRAMES}")
+
+    if args.video:
+        Config.VIDEO_PATH = args.video
+        print(f"[CLI] ✅ 视频路径已设置: {Config.VIDEO_PATH}")
 
     if args.dataset_root:
         dataset_root = args.dataset_root.rstrip(os.sep)
@@ -2788,11 +3207,30 @@ if __name__ == "__main__":
                 if video_found:
                     break
 
-        if video_found:
+        if args.video:
+            Config.VIDEO_PATH = args.video
+            print(f"[CLI] ✅ 视频路径已设置: {Config.VIDEO_PATH}")
+            video_found = True
+        elif video_found:
             print(f"[CLI] ✅ 视频路径已设置: {Config.VIDEO_PATH}")
 
         else:
             print(f"[CLI] ⚠️ 未在 {dataset_root}下找到MP4视频，保持默认: {Config.VIDEO_PATH}")
+
+    if not os.path.exists(Config.VIDEO_PATH):
+        fallback_video = None
+        for root, dirs, files in os.walk(Config.MEDIA_ROOT):
+            for file in files:
+                if file.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
+                    fallback_video = os.path.join(root, file)
+                    break
+            if fallback_video:
+                break
+        if fallback_video:
+            Config.VIDEO_PATH = fallback_video
+            print(f"[CLI] ✅ 默认视频不存在，自动选择: {Config.VIDEO_PATH}")
+        else:
+            print(f"[CLI] ⚠️ 未在 {Config.MEDIA_ROOT} 下找到可用视频: {Config.VIDEO_PATH}")
 
     try:
         mp.set_start_method('spawn')
