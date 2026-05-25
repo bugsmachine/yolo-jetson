@@ -232,16 +232,13 @@ class Config:
     SELECTOR_ENABLED = True
     SELECTOR_CHECKPOINT = "checkpoints/best.pth"
     SELECTOR_DEVICE = "cpu"
+    SELECTOR_WARMUP_FRAMES = 10
     SELECTOR_MAX_SKIP_FRAMES = 10
     SELECTOR_FORCE_GPU_INTERVAL_FRAMES = 10
-    SELECTOR_HIGH_MOTION_PIXELS = 8.0
-    SELECTOR_HIGH_FLOW_RESIDUAL = 4.0
-    SELECTOR_LOW_FLOW_VALID_RATIO = 0.25
-    SELECTOR_MAX_POSITION_UNCERTAINTY = 2000.0   # mean uncertainty across confirmed tracks
-    SELECTOR_PREDICTION_ERROR_P95 = 0.90         # 1-IoU metric; match calibration interval eval
-    SELECTOR_MIN_TRACKER_CONFIDENCE = 0.20
-    SELECTOR_KALMAN_PREFERENCE_MARGIN = 0.15      # if P(kalman) is close to P(gmc), prefer Kalman
-    SELECTOR_KALMAN_LOW_MOTION_PIXELS = 0.50      # low camera motion: GMC adds little value
+    # Set to 0 to disable. Needs calibration against real deployment data —
+    # TRAIN_MODE values (GPU every frame) have different scale from deployment.
+    SELECTOR_MAX_POSITION_UNCERTAINTY = 0.0
+    SELECTOR_PREDICTION_ERROR_P95 = 0.0
 
     # ==================== 运行时视频参数 ====================
     VIDEO_WIDTH = 1920          # 默认 1920 (运行时可能会更新)
@@ -411,8 +408,7 @@ def build_runtime_selector() -> RuntimeChannelSelector:
     return RuntimeChannelSelector(
         checkpoint_path=resolve_existing_runtime_path(Config.SELECTOR_CHECKPOINT),
         device=Config.SELECTOR_DEVICE,
-        fallback_low=Config.LSTM_THRESHOLD_LOW,
-        fallback_high=Config.LSTM_THRESHOLD_HIGH,
+        warmup_frames=Config.SELECTOR_WARMUP_FRAMES,
         max_skip_frames=Config.SELECTOR_MAX_SKIP_FRAMES,
         force_gpu_interval=Config.SELECTOR_FORCE_GPU_INTERVAL_FRAMES,
         uncertainty_threshold=Config.SELECTOR_MAX_POSITION_UNCERTAINTY,
@@ -420,17 +416,11 @@ def build_runtime_selector() -> RuntimeChannelSelector:
     )
 
 
-def runtime_selector_ready(selector: RuntimeChannelSelector) -> bool:
-    return bool(getattr(selector, "model_available", False))
-
-
 def runtime_decision_source(decision) -> str:
     forced_reason = getattr(decision, "forced_reason", "")
     if forced_reason:
         return f"forced:{forced_reason}"
-    if getattr(decision, "model_available", False):
-        return "model"
-    return "fallback"
+    return "model"
 
 
 def mark_inflight_yolo_for_scheduler(
@@ -506,11 +496,9 @@ class Tier0_LSTM_Thread(threading.Thread):
             blockSize=7
         )
         self.feature_extractor = ReaderFeatureExtractor()
+        # selector 没有降级路径：checkpoint 加载失败会直接抛异常
         self.selector = build_runtime_selector()
-        if runtime_selector_ready(self.selector):
-            print(f"[Tier0-LSTM] ✅ selector checkpoint loaded: {Config.SELECTOR_CHECKPOINT}")
-        elif self.selector.load_error:
-            print(f"[Tier0-LSTM] ⚠️ selector模型不可用，使用规则回退: {self.selector.load_error}")
+        print(f"[Tier0-LSTM] ✅ selector checkpoint loaded: {Config.SELECTOR_CHECKPOINT}")
 
         # 训练模式: GPU 推理状态跟踪 (用于构建真实 StateSnapshot)
         self._train_last_gpu_frame_id = -1
@@ -906,73 +894,69 @@ class Tier0_LSTM_Thread(threading.Thread):
 
     def _generate_gmc_prediction(self, packet: FramePacket) -> DetectionResult:
         """
-        使用全局运动补偿(GMC)预测目标位置
-        基于光流计算的全局运动向量平移检测框
+        GMC + Kalman 联合预测：将相机运动注入 Kalman 状态后执行 predict。
+        相机运动补偿消除全局漂移，Kalman 在此基础上叠加个体运动预测。
+        如果 Kalman tracker 没有活跃 track，回退到纯框平移。
         """
-
+        global global_kalman_tracker, kalman_tracker_lock
         global latest_detection_boxes, latest_detection_frame_id, latest_detection_lock
 
-        with latest_detection_lock:
-            prev_boxes = latest_detection_boxes.copy()
-            prev_frame_id = latest_detection_frame_id
-
-        if not prev_boxes or prev_frame_id < 0:
-            return DetectionResult(
-                frame_id=packet.frame_id,
-                boxes=[],
-                source="tier0_gmc",
-                latency_ms=0.5,
-                timestamp=packet.timestamp,
-                image=packet.image,
-            )
-
-        motion_vec = packet.motion_vec if packet.motion_vec else (0.0, 0.0)
-        dx, dy = motion_vec
-
+        dx, dy = packet.motion_vec if packet.motion_vec else (0.0, 0.0)
         h, w = packet.image.shape[:2]
 
         predicted_boxes = []
-        for box in prev_boxes:
-            new_x1 = box['x1'] + dx
-            new_y1 = box['y1'] + dy
-            new_x2 = box['x2'] + dx
-            new_y2 = box['y2'] + dy
 
-            if new_x2 > 0 and new_x1 < w and new_y2 > 0 and new_y1 < h:
-                new_x1 = max(0, min(new_x1, w - 1))
-                new_y1 = max(0, min(new_y1, h - 1))
-                new_x2 = max(0, min(new_x2, w - 1))
-                new_y2 = max(0, min(new_y2, h - 1))
-
-                if new_x2 > new_x1 and new_y2 > new_y1:
+        if global_kalman_tracker is not None:
+            with kalman_tracker_lock:
+                predicted_boxes = global_kalman_tracker.predict_with_gmc(dx, dy)
+        else:
+            # 回退：无 Kalman tracker，纯平移上一帧框
+            with latest_detection_lock:
+                prev_boxes = latest_detection_boxes.copy()
+            for box in prev_boxes:
+                nx1, ny1 = box['x1'] + dx, box['y1'] + dy
+                nx2, ny2 = box['x2'] + dx, box['y2'] + dy
+                if nx2 > 0 and nx1 < w and ny2 > 0 and ny1 < h:
                     predicted_boxes.append({
-                        'x1': float(new_x1),
-                        'y1': float(new_y1),
-                        'x2': float(new_x2),
-                        'y2': float(new_y2),
-                        'conf': box['conf'] * 0.9,
-                        'class': box['class']
+                        'x1': float(max(0, nx1)), 'y1': float(max(0, ny1)),
+                        'x2': float(min(nx2, w - 1)), 'y2': float(min(ny2, h - 1)),
+                        'conf': box['conf'] * 0.9, 'class': box['class'],
                     })
 
-        if Config.ENABLE_STATS and not Config.PERFORMANCE_MODE:
-            print(f"[Tier0-GMC] Frame {packet.frame_id}: motion=({dx:.1f}, {dy:.1f}), "
-                  f"predicted {len(predicted_boxes)} boxes from frame {prev_frame_id}")
+        clipped_boxes = []
+        for box in predicted_boxes:
+            x1 = max(0, min(box['x1'], w - 1))
+            y1 = max(0, min(box['y1'], h - 1))
+            x2 = max(0, min(box['x2'], w - 1))
+            y2 = max(0, min(box['y2'], h - 1))
+            if x2 > x1 and y2 > y1:
+                clipped_boxes.append({
+                    'x1': float(x1), 'y1': float(y1),
+                    'x2': float(x2), 'y2': float(y2),
+                    'conf': box.get('conf', 0.5) * 0.95,
+                    'class': box.get('class', 0),
+                    'track_id': box.get('track_id', -1),
+                })
 
-        if predicted_boxes:
+        if Config.ENABLE_STATS and not Config.PERFORMANCE_MODE:
+            print(f"[Tier0-GMC] Frame {packet.frame_id}: motion=({dx:.1f},{dy:.1f}), "
+                  f"predicted {len(clipped_boxes)} boxes")
+
+        if clipped_boxes:
             with latest_detection_lock:
                 if packet.frame_id >= latest_detection_frame_id:
-                    latest_detection_boxes = [box.copy() for box in predicted_boxes]
+                    latest_detection_boxes = [box.copy() for box in clipped_boxes]
                     latest_detection_frame_id = packet.frame_id
 
         return DetectionResult(
             frame_id=packet.frame_id,
-            boxes=predicted_boxes,
+            boxes=clipped_boxes,
             source="tier0_gmc",
             latency_ms=0.5,
             timestamp=packet.timestamp,
             image=packet.image,
-            max_conf=max([b['conf'] for b in predicted_boxes]) if predicted_boxes else 0.0,
-            num_boxes=len(predicted_boxes)
+            max_conf=max([b['conf'] for b in clipped_boxes]) if clipped_boxes else 0.0,
+            num_boxes=len(clipped_boxes)
         )
 
 class Tier1_YOLO_Thread(threading.Thread):
@@ -1539,6 +1523,17 @@ class ResultProcessor(threading.Thread):
         self.last_gpu_max_conf = 0.0
         self.video_writer = None
 
+        # Reorder buffer: holds results that arrived out of frame_id order.
+        # Kalman/GMC results arrive in ~0.5 ms; YOLO results arrive in ~20 ms,
+        # so YOLO frame N lands in the queue after Kalman frames N+1..N+k.
+        # We buffer and flush in strict frame_id order to keep the output video
+        # monotone. MAX_REORDER_BUFFER caps memory use; frames beyond it are
+        # force-flushed in arrival order to avoid a stall when a YOLO result
+        # is dropped.
+        self._vis_buffer: dict = {}          # frame_id -> DetectionResult
+        self._vis_next_frame_id: int = -1    # -1 = not yet initialised
+        self._MAX_REORDER_BUFFER: int = 60   # ~2 s at 30 fps is enough headroom
+
     def run(self):
         if not Config.PERFORMANCE_MODE:
             print("[ResultProcessor] 线程启动")
@@ -1683,6 +1678,12 @@ class ResultProcessor(threading.Thread):
         if Config.TRAIN_MODE and global_train_collector is not None:
             global_train_collector.save_to_file(Config.TRAIN_DATA_OUTPUT)
 
+        # Flush any remaining buffered frames in order before closing the writer.
+        if Config.SAVE_VIS_VIDEO and self._vis_buffer:
+            for fid in sorted(self._vis_buffer.keys()):
+                self._do_write_frame(self._vis_buffer[fid])
+            self._vis_buffer.clear()
+
         if self.video_writer is not None:
             self.video_writer.release()
             self.video_writer = None
@@ -1711,9 +1712,44 @@ class ResultProcessor(threading.Thread):
         cv2.waitKey(1)
 
     def _write_visualized_frame(self, result: DetectionResult):
+        """Buffer results by frame_id and flush in strict order.
+
+        YOLO results arrive ~20 ms after dispatch; Kalman/GMC results arrive
+        in <1 ms. Without reordering the video writer would receive frame IDs
+        like 502, 503, ..., 510, 502 (YOLO late), causing visible jumps.
+        """
         if result.image is None:
             return
 
+        # Initialise expected frame counter on first result.
+        if self._vis_next_frame_id < 0:
+            self._vis_next_frame_id = result.frame_id
+
+        # Discard results that already fell behind the write cursor
+        # (can happen if the buffer was force-flushed past them).
+        if result.frame_id < self._vis_next_frame_id:
+            return
+
+        self._vis_buffer[result.frame_id] = result
+
+        # Flush contiguous prefix of the buffer in frame_id order.
+        while self._vis_next_frame_id in self._vis_buffer:
+            self._do_write_frame(self._vis_buffer.pop(self._vis_next_frame_id))
+            self._vis_next_frame_id += 1
+
+        # Safety valve: if the buffer is too large, a YOLO result was probably
+        # dropped. Force-flush the oldest frames so we don't stall forever.
+        if len(self._vis_buffer) > self._MAX_REORDER_BUFFER:
+            for fid in sorted(self._vis_buffer.keys()):
+                if fid < self._vis_next_frame_id:
+                    self._vis_buffer.pop(fid)
+                    continue
+                self._do_write_frame(self._vis_buffer.pop(fid))
+                self._vis_next_frame_id = fid + 1
+                if len(self._vis_buffer) <= self._MAX_REORDER_BUFFER // 2:
+                    break
+
+    def _do_write_frame(self, result: DetectionResult):
         frame = self._render_result_frame(result)
         if self.video_writer is None:
             output_dir = os.path.dirname(Config.VIS_VIDEO_PATH)
@@ -1731,7 +1767,6 @@ class ResultProcessor(threading.Thread):
                 print(f"[ResultProcessor] ⚠️ 无法创建可视化视频: {Config.VIS_VIDEO_PATH}")
                 self.video_writer = None
                 return
-
         self.video_writer.write(frame)
 
     def _render_result_frame(self, result: DetectionResult) -> np.ndarray:
@@ -2593,11 +2628,9 @@ def video_reader_process(
 
     feature_extractor = ReaderFeatureExtractor()
     latest_state_snapshot = StateSnapshot()
+    # selector 没有降级路径：checkpoint 加载失败会直接抛异常
     selector = build_runtime_selector()
-    if runtime_selector_ready(selector):
-        print(f"[VideoReaderProcess] ✅ selector checkpoint loaded: {Config.SELECTOR_CHECKPOINT}")
-    elif selector.load_error:
-        print(f"[VideoReaderProcess] ⚠️ selector模型不可用，使用规则回退: {selector.load_error}")
+    print(f"[VideoReaderProcess] ✅ selector checkpoint loaded: {Config.SELECTOR_CHECKPOINT}")
 
     ready_event.set()
     print("[VideoReaderProcess] ✅ 就绪")
@@ -2800,61 +2833,67 @@ class FrameDispatcher(threading.Thread):
         )
 
     def _generate_gmc_prediction(self, packet: FramePacket) -> DetectionResult:
-        """使用全局运动补偿预测目标位置"""
+        """GMC + Kalman 联合预测（单线程版本）"""
+        global global_kalman_tracker, kalman_tracker_lock
         global latest_detection_boxes, latest_detection_frame_id, latest_detection_lock
-
-        with latest_detection_lock:
-            prev_boxes = latest_detection_boxes.copy()
-            prev_frame_id = latest_detection_frame_id
-
-        if not prev_boxes or prev_frame_id < 0:
-            return DetectionResult(
-                frame_id=packet.frame_id,
-                boxes=[],
-                source="tier0_gmc",
-                latency_ms=0.5,
-                timestamp=packet.timestamp,
-                image=packet.image,
-            )
 
         dx, dy = packet.motion_vec if packet.motion_vec else (0.0, 0.0)
         h, w = packet.image.shape[:2]
 
         predicted_boxes = []
-        for box in prev_boxes:
-            new_x1 = box['x1'] + dx
-            new_y1 = box['y1'] + dy
-            new_x2 = box['x2'] + dx
-            new_y2 = box['y2'] + dy
 
-            if new_x2 > 0 and new_x1 < w and new_y2 > 0 and new_y1 < h:
-                new_x1 = max(0, min(new_x1, w - 1))
-                new_y1 = max(0, min(new_y1, h - 1))
-                new_x2 = max(0, min(new_x2, w - 1))
-                new_y2 = max(0, min(new_y2, h - 1))
-                if new_x2 > new_x1 and new_y2 > new_y1:
+        if global_kalman_tracker is not None:
+            with kalman_tracker_lock:
+                predicted_boxes = global_kalman_tracker.predict_with_gmc(dx, dy)
+        else:
+            with latest_detection_lock:
+                prev_boxes = latest_detection_boxes.copy()
+                prev_frame_id = latest_detection_frame_id
+            if not prev_boxes or prev_frame_id < 0:
+                return DetectionResult(
+                    frame_id=packet.frame_id, boxes=[], source="tier0_gmc",
+                    latency_ms=0.5, timestamp=packet.timestamp, image=packet.image,
+                )
+            for box in prev_boxes:
+                nx1, ny1 = box['x1'] + dx, box['y1'] + dy
+                nx2, ny2 = box['x2'] + dx, box['y2'] + dy
+                if nx2 > 0 and nx1 < w and ny2 > 0 and ny1 < h:
                     predicted_boxes.append({
-                        'x1': float(new_x1), 'y1': float(new_y1),
-                        'x2': float(new_x2), 'y2': float(new_y2),
-                        'conf': box['conf'] * 0.9,
-                        'class': box['class']
+                        'x1': float(max(0, nx1)), 'y1': float(max(0, ny1)),
+                        'x2': float(min(nx2, w - 1)), 'y2': float(min(ny2, h - 1)),
+                        'conf': box['conf'] * 0.9, 'class': box['class'],
                     })
 
-        if predicted_boxes:
+        clipped_boxes = []
+        for box in predicted_boxes:
+            x1 = max(0, min(box['x1'], w - 1))
+            y1 = max(0, min(box['y1'], h - 1))
+            x2 = max(0, min(box['x2'], w - 1))
+            y2 = max(0, min(box['y2'], h - 1))
+            if x2 > x1 and y2 > y1:
+                clipped_boxes.append({
+                    'x1': float(x1), 'y1': float(y1),
+                    'x2': float(x2), 'y2': float(y2),
+                    'conf': box.get('conf', 0.5) * 0.95,
+                    'class': box.get('class', 0),
+                    'track_id': box.get('track_id', -1),
+                })
+
+        if clipped_boxes:
             with latest_detection_lock:
                 if packet.frame_id >= latest_detection_frame_id:
-                    latest_detection_boxes = [box.copy() for box in predicted_boxes]
+                    latest_detection_boxes = [box.copy() for box in clipped_boxes]
                     latest_detection_frame_id = packet.frame_id
 
         return DetectionResult(
             frame_id=packet.frame_id,
-            boxes=predicted_boxes,
+            boxes=clipped_boxes,
             source="tier0_gmc",
             latency_ms=0.5,
             timestamp=packet.timestamp,
             image=packet.image,
-            max_conf=max([b['conf'] for b in predicted_boxes]) if predicted_boxes else 0.0,
-            num_boxes=len(predicted_boxes)
+            max_conf=max([b['conf'] for b in clipped_boxes]) if clipped_boxes else 0.0,
+            num_boxes=len(clipped_boxes)
         )
 
 def main():

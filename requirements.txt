@@ -1,0 +1,26 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Core inference & detection
+# ─────────────────────────────────────────────────────────────────────────────
+ultralytics>=8.3.0          # YOLOv11 detection/tracking
+numpy>=1.26.0               # Array operations
+opencv-python>=4.8.0        # Video I/O and image processing
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deep learning (channel-selector LSTM)
+# ─────────────────────────────────────────────────────────────────────────────
+torch>=2.1.0                # PyTorch — install the JetPack-specific wheel on
+                             # Jetson; on desktop CPU/CUDA wheels work fine.
+                             # See: https://pypi.org/project/torch/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training utilities
+# ─────────────────────────────────────────────────────────────────────────────
+scikit-learn>=1.3.0         # Metrics (accuracy, precision, recall, confusion matrix)
+tensorboard>=2.14.0         # Training curve visualisation
+tqdm>=4.66.0                # Progress bars
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config & visualisation
+# ─────────────────────────────────────────────────────────────────────────────
+PyYAML>=6.0                 # YAML config parsing
+matplotlib>=3.7.0           # Plots and evaluation visualisation

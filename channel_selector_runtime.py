@@ -146,8 +146,7 @@ class RuntimeChannelSelector:
         self,
         checkpoint_path: str = "../checkpoints/best.pth",
         device: str = "cpu",
-        fallback_low: float = 0.3,
-        fallback_high: float = 0.7,
+        warmup_frames: int = 10,
         max_skip_frames: int = 60,
         force_gpu_interval: int = 60,
         uncertainty_threshold: float = 100000.0,
@@ -155,8 +154,7 @@ class RuntimeChannelSelector:
     ) -> None:
         self.checkpoint_path = Path(checkpoint_path)
         self.device_name = device
-        self.fallback_low = float(fallback_low)
-        self.fallback_high = float(fallback_high)
+        self.warmup_frames = int(warmup_frames)
         self.max_skip_frames = int(max_skip_frames)
         self.force_gpu_interval = int(force_gpu_interval)
         self.uncertainty_threshold = float(uncertainty_threshold)
@@ -165,7 +163,8 @@ class RuntimeChannelSelector:
         self.feature_names: List[str] = list(DEFAULT_FEATURE_NAMES)
         self.n_frames = 60
         self.history: Deque[List[float]] = deque(maxlen=self.n_frames)
-        self.actions: Deque[int] = deque(maxlen=max(self.max_skip_frames, self.force_gpu_interval, 1))
+        # Only needs to hold max_skip_frames entries to count consecutive skips accurately.
+        self.actions: Deque[int] = deque(maxlen=max(self.max_skip_frames, 1) + 1)
         self.model: Any = None
         self.torch: Any = None
         self.device: Any = None
@@ -193,11 +192,7 @@ class RuntimeChannelSelector:
             self.actions.append(decision.action)
             return decision
 
-        if self.model_available:
-            decision = self._model_decision()
-        else:
-            decision = self._fallback_decision(selector_input)
-
+        decision = self._model_decision()
         self.actions.append(decision.action)
         return decision
 
@@ -206,7 +201,9 @@ class RuntimeChannelSelector:
             import torch
         except Exception as exc:
             self.load_error = f"torch unavailable: {exc}"
-            return
+            raise RuntimeError(
+                f"RuntimeChannelSelector 需要 PyTorch，但导入失败: {exc}"
+            ) from exc
 
         try:
             checkpoint = torch.load(self.checkpoint_path, map_location="cpu")
@@ -247,6 +244,9 @@ class RuntimeChannelSelector:
             self.load_error = str(exc)
             self.model_available = False
             self.model = None
+            raise RuntimeError(
+                f"RuntimeChannelSelector 无法加载 checkpoint '{self.checkpoint_path}': {exc}"
+            ) from exc
 
     def _feature_vector(self, features: Dict[str, float]) -> List[float]:
         return [float(features.get(name, 0.0) or 0.0) for name in self.feature_names]
@@ -276,13 +276,8 @@ class RuntimeChannelSelector:
             for idx in range(min(len(probs_tensor), len(ACTION_TO_CHANNEL)))
         }
 
-        # 模型只选 kalman vs gmc；YOLO 校准由 guardrail (max_skip_frames) 控制
-        if channel == "inference":
-            kalman_prob = probabilities.get("kalman", 0.0)
-            gmc_prob = probabilities.get("gmc", 0.0)
-            channel = "kalman" if kalman_prob >= gmc_prob else "gmc"
-            pred_idx = CHANNEL_TO_ACTION[channel]
-
+        # 模型是主决策器：三分类结果直接输出，允许模型自己选 INVOKE_TIER1。
+        # guardrail 只在"距离上次 GPU 校正过久"时兜底，不再独占 YOLO 触发权。
         return ChannelSelectorDecision(
             action=pred_idx,
             score=float(probs_tensor[pred_idx]),
@@ -291,24 +286,42 @@ class RuntimeChannelSelector:
             model_available=True,
         )
 
-    def _fallback_decision(self, selector_input: ChannelSelectorInput) -> ChannelSelectorDecision:
-        score = float(selector_input.frame_features.frame_diff_mean)
-        # 无模型时只在 kalman/gmc 间选，不主动触发 YOLO
-        channel = "kalman" if score < self.fallback_low else "gmc"
-        return ChannelSelectorDecision(
-            action=CHANNEL_TO_ACTION[channel],
-            score=score,
-            channel=channel,
-            model_available=False,
-        )
-
     def _guardrail_reason(self, selector_input: ChannelSelectorInput) -> str:
+        ff = selector_input.frame_features
+        ss = selector_input.state_snapshot
+
+        # First N frames: always run GPU to build initial tracking baseline.
+        if self.warmup_frames > 0 and ff.frame_id < self.warmup_frames:
+            return "warmup"
+
+        # First frame: history is empty, always run GPU to seed the tracker.
+        if ff.is_bootstrap_frame:
+            return "bootstrap"
+
+        # Tracker covariance too large: predictions unreliable.
+        if self.uncertainty_threshold > 0 and ss.max_position_uncertainty > self.uncertainty_threshold:
+            return "uncertainty_threshold"
+
+        # Prediction error too high: new targets / edge cases degrading tracking.
+        if self.prediction_error_threshold > 0 and ss.prediction_error_p95 > self.prediction_error_threshold:
+            return "prediction_error_p95"
+
+        # Local consecutive skips: how many frames in a row this selector has chosen skip.
+        # Resets whenever the model itself picks inference — not a fixed clock.
         consecutive_skips = 0
         for action in reversed(self.actions):
             if action == CHANNEL_TO_ACTION["inference"]:
                 break
             consecutive_skips += 1
-        if consecutive_skips >= self.max_skip_frames:
+        if self.max_skip_frames > 0 and consecutive_skips >= self.max_skip_frames:
             return "max_skip_frames"
+
+        # Global GPU interval: time since main process last confirmed a GPU frame.
+        # Separate from the local count so stale snapshots don't mask a long local streak.
+        snapshot_gap = ss.frames_since_last_gpu(ff.frame_id)
+        if snapshot_gap < 0:
+            return "no_gpu_history"
+        if self.force_gpu_interval > 0 and snapshot_gap >= self.force_gpu_interval:
+            return "force_gpu_interval"
 
         return ""

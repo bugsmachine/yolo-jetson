@@ -16,7 +16,7 @@ from channel_selector_interfaces import (
     FrameFeatureSnapshot,
     StateSnapshot,
 )
-from src.runtime_selector import ACTION_TO_CHANNEL, RuntimeChannelSelector
+from channel_selector_runtime import ACTION_TO_CHANNEL, RuntimeChannelSelector
 
 
 COMPUTE_COST = {
@@ -31,11 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data", nargs="+", default=["data/labels/*.json"], help="JSON files or glob patterns.")
     parser.add_argument("--checkpoint", default="checkpoints/best.pth", help="Selector checkpoint path.")
     parser.add_argument("--output", default="results/runtime_selector_eval.json", help="Output summary JSON.")
-    parser.add_argument("--low", type=float, default=0.3, help="Old frame-diff low threshold.")
-    parser.add_argument("--high", type=float, default=0.7, help="Old frame-diff high threshold.")
+    parser.add_argument("--low", type=float, default=0.3, help="Frame-diff low threshold for fixed-threshold baseline.")
+    parser.add_argument("--high", type=float, default=0.7, help="Frame-diff high threshold for fixed-threshold baseline.")
+    parser.add_argument("--warmup-frames", type=int, default=10)
     parser.add_argument("--max-skip-frames", type=int, default=60)
     parser.add_argument("--force-gpu-interval", type=int, default=60)
-    parser.add_argument("--uncertainty-threshold", type=float, default=100000.0)
+    parser.add_argument("--uncertainty-threshold", type=float, default=2000.0)
     parser.add_argument("--prediction-error-threshold", type=float, default=0.9)
     return parser.parse_args()
 
@@ -128,8 +129,7 @@ def summarize(name: str, channels: List[str], f1_values: List[float]) -> Dict[st
 def evaluate_file(path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     selector = RuntimeChannelSelector(
         checkpoint_path=args.checkpoint,
-        fallback_low=args.low,
-        fallback_high=args.high,
+        warmup_frames=args.warmup_frames,
         max_skip_frames=args.max_skip_frames,
         force_gpu_interval=args.force_gpu_interval,
         uncertainty_threshold=args.uncertainty_threshold,

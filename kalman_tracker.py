@@ -335,6 +335,34 @@ class MultiObjectKalmanTracker:
 
         return results
 
+    def predict_with_gmc(self, dx: float, dy: float) -> List[Dict]:
+        """
+        GMC + Kalman 联合预测：先将相机运动偏移注入每个 tracker 的状态，
+        再执行 Kalman predict（个体运动预测叠加在相机补偿之上）。
+
+        Args:
+            dx: 相机全局运动 X 分量（像素）
+            dy: 相机全局运动 Y 分量（像素）
+
+        Returns:
+            预测的目标列表
+        """
+        self.frame_count += 1
+
+        results = []
+        for trk in self.trackers:
+            if not trk.is_dead():
+                # 将相机运动叠加到状态向量的位置分量（x_center, y_center）
+                trk.x[0, 0] += dx
+                trk.x[1, 0] += dy
+                predicted_bbox = trk.predict()
+                if trk.is_confirmed():
+                    results.append(predicted_bbox)
+
+        self.trackers = [trk for trk in self.trackers if not trk.is_dead()]
+
+        return results
+
     def get_tracker_count(self) -> int:
         """获取当前跟踪器数量"""
         return len(self.trackers)
